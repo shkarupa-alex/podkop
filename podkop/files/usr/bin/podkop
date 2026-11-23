@@ -182,7 +182,7 @@ start_main() {
 # updated, so traffic that should be proxied is blocked instead of going direct. A failed start does not remove them
 fail_closed_enabled() {
     local fail_closed
-    config_get_bool fail_closed "settings" "fail_closed" 0
+    config_get_bool fail_closed "settings" "fail_closed" 1
 
     [ "$fail_closed" -eq 1 ]
 }
