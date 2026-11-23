@@ -21,6 +21,8 @@ LISTS_LOADED_FILE="$PODKOP_STATE_FOLDER/lists-loaded"
 PODKOP_STARTED_FILE="$PODKOP_STATE_FOLDER/started"
 PODKOP_RUN_ID_FILE="$PODKOP_STATE_FOLDER/run-id"
 PODKOP_START_PID_FILE="$PODKOP_STATE_FOLDER/start-pid"
+# The clock was set by sync_time since the boot (the folder is on tmpfs)
+TIME_SYNCED_FILE="$PODKOP_STATE_FOLDER/time-synced"
 LISTS_UPDATE_LOCK_FILE="/var/lock/podkop-list-update.lock"
 # Lists loaded in fail-closed mode, kept on flash for the next boot. Written only when they change
 LISTS_CACHE_FOLDER="/usr/share/podkop/lists-cache"
