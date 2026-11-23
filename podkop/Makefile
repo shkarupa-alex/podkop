@@ -39,6 +39,7 @@ define Package/podkop/prerm
 
 if [ "$${PKG_UPGRADE}" != "1" ]; then
 	grep -q "105 podkop" /etc/iproute2/rt_tables && sed -i "/105 podkop/d" /etc/iproute2/rt_tables
+	rm -rf /usr/share/podkop/lists-cache
 fi
 
 exit 0
@@ -54,6 +55,9 @@ define Package/podkop/install
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/podkop $(1)/etc/config/podkop
+
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_DATA) ./files/etc/hotplug.d/iface/50-podkop $(1)/etc/hotplug.d/iface/50-podkop
 
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./files/usr/bin/podkop $(1)/usr/bin/podkop

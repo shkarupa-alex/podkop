@@ -117,7 +117,11 @@ start_main() {
 
     # A lists update that started before this start used the previous config, see mark_lists_loaded
     mkdir -p "$PODKOP_STATE_FOLDER"
+    echo "$$" > "$PODKOP_START_PID_FILE"
     cat /proc/sys/kernel/random/uuid > "$PODKOP_RUN_ID_FILE"
+
+    # Added first, so a start that stops on an error is retried
+    add_watchdog_cron_job
 
     # The nft table is built from the config, so the config is migrated first
     migration
@@ -168,14 +172,25 @@ start_main() {
     update_gate
 
     log "Nice"
+    start_background_list_update
+}
+
+start_background_list_update() {
     # The job may run for long in fail-closed mode, it must not hold the procd lock of the init script (fd 1000,
-    # taken by reload), or the next stop and restart would wait for it
+    # taken by reload), or the next stop and restart would wait for it, nor the lock of the watchdog (fd 8)
     (
         # shellcheck disable=SC3023 # busybox ash supports fds above 9
-        exec 1000>&-
+        exec 1000>&- 8>&-
         list_update_after_start
     ) &
     echo $! > /var/run/podkop_list_update.pid
+}
+
+list_update_running() {
+    local pid
+    pid="$(cat /var/run/podkop_list_update.pid 2> /dev/null)"
+
+    [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null
 }
 
 # In fail-closed mode podkop keeps its nftables rules, policy routing and dnsmasq settings while it is restarted or
@@ -245,6 +260,7 @@ stop_main() {
     else
         reset_source_rulesets 0
         rm -rf "$PODKOP_STATE_FOLDER"
+        remove_watchdog_cron_job
 
         log "Flush nft"
         if nft list table inet "$NFT_TABLE_NAME" > /dev/null 2>&1; then
@@ -491,9 +507,25 @@ print_nft_rules_script() {
     echo "add rule $table mangle_output ip daddr $SB_FAKEIP_INET4_RANGE meta l4proto tcp meta mark set $NFT_FAKEIP_MARK counter"
     echo "add rule $table mangle_output ip daddr $SB_FAKEIP_INET4_RANGE meta l4proto udp meta mark set $NFT_FAKEIP_MARK counter"
 
+    local gate_chain_spec="{ type filter hook forward priority -1; policy accept; }"
+    local guard_chain_spec="{ type filter hook postrouting priority 0; policy accept; }"
     if fail_closed_enabled; then
-        echo "add chain $table $NFT_GATE_CHAIN_NAME { type filter hook forward priority -1; policy accept; }"
+        echo "add chain $table $NFT_GATE_CHAIN_NAME $gate_chain_spec"
         print_gate_rules "$(gate_state)"
+
+        # Marked traffic is delivered to sing-box locally. It leaves the router only when the ip rule of podkop is
+        # lost (e.g. netifd was restarted) and would go direct, so it is dropped
+        echo "add chain $table $NFT_GUARD_CHAIN_NAME $guard_chain_spec"
+        echo "flush chain $table $NFT_GUARD_CHAIN_NAME"
+        echo "add rule $table $NFT_GUARD_CHAIN_NAME oifname != \"lo\" meta mark & $NFT_FAKEIP_MARK == $NFT_FAKEIP_MARK counter drop"
+    else
+        # A table kept from a run in fail-closed mode must not keep blocking
+        echo "add chain $table $NFT_GATE_CHAIN_NAME $gate_chain_spec"
+        echo "flush chain $table $NFT_GATE_CHAIN_NAME"
+        echo "delete chain $table $NFT_GATE_CHAIN_NAME"
+        echo "add chain $table $NFT_GUARD_CHAIN_NAME $guard_chain_spec"
+        echo "flush chain $table $NFT_GUARD_CHAIN_NAME"
+        echo "delete chain $table $NFT_GUARD_CHAIN_NAME"
     fi
 }
 
@@ -598,8 +630,8 @@ prune_lists_loaded() {
 # Called after a lists update that loaded every list, with the id of the podkop run it was started in. An update that
 # started before a restart used the previous config and does not mark the lists of the new one as loaded
 mark_lists_loaded() {
-    if [ "$#" -gt 0 ] && [ "$1" != "$(cat "$PODKOP_RUN_ID_FILE" 2> /dev/null)" ]; then
-        log "Podkop was restarted during the lists update, the lists are not marked as loaded" "warn"
+    if [ "$#" -gt 0 ] && { [ -z "$1" ] || [ "$1" != "$(cat "$PODKOP_RUN_ID_FILE" 2> /dev/null)" ]; }; then
+        log "Podkop was stopped or restarted during the lists update, the lists are not marked as loaded" "warn"
         return 0
     fi
 
@@ -607,6 +639,83 @@ mark_lists_loaded() {
     print_lists_signature > "$LISTS_LOADED_FILE"
     write_lists_pending_ruleset
     update_gate
+    save_lists_cache
+}
+
+# Elements of a subnet set of the podkop table, one per line
+print_set_elements() {
+    local set="$1"
+
+    nft list set inet "$NFT_TABLE_NAME" "$set" 2> /dev/null |
+        sed -n '/elements = {/,/}/p' | sed 's/.*elements = {//; s/}.*//' | tr ',' '\n' |
+        sed 's/[[:space:]]//g; /^$/d' | sort -u
+}
+
+# In fail-closed mode direct traffic is blocked until the lists are loaded. The community subnet lists are kept on
+# flash, so after a reboot it is not blocked until they are downloaded again (GitHub may be unreachable for long).
+# Remote lists of the user are not kept, they are loaded by the lists update as before.
+# The files are rewritten only when the lists have changed, to spare the flash
+save_lists_cache() {
+    local tmpdir set file changed=0
+
+    fail_closed_enabled || return 0
+
+    tmpdir="$(mktemp -d)"
+    print_lists_signature | awk '$2 == "community_lists"' > "$tmpdir/loaded"
+    for set in "$NFT_COMMON_SET_NAME" "$NFT_DISCORD_SET_NAME"; do
+        nft list set inet "$NFT_TABLE_NAME" "$set" > /dev/null 2>&1 || continue
+        print_set_elements "$set" > "$tmpdir/$set"
+    done
+
+    for file in "$tmpdir"/* "$LISTS_CACHE_FOLDER"/*; do
+        [ -f "$file" ] || continue
+        cmp -s "$tmpdir/$(basename "$file")" "$LISTS_CACHE_FOLDER/$(basename "$file")" || changed=1
+    done
+
+    if [ "$changed" -eq 1 ]; then
+        rm -rf "$LISTS_CACHE_FOLDER.new"
+        mkdir -p "$LISTS_CACHE_FOLDER.new"
+        if cp "$tmpdir"/* "$LISTS_CACHE_FOLDER.new/"; then
+            rm -rf "$LISTS_CACHE_FOLDER"
+            mv "$LISTS_CACHE_FOLDER.new" "$LISTS_CACHE_FOLDER"
+            log "Loaded lists are kept on flash for the next start"
+        else
+            rm -rf "$LISTS_CACHE_FOLDER.new"
+            log "Failed to keep the loaded lists on flash" "warn"
+        fi
+    fi
+    rm -rf "$tmpdir"
+}
+
+# Load the lists kept on flash into a newly created table and count them as loaded. The first complete lists update
+# replaces them, see finish_lists_staging
+restore_lists_cache() {
+    local nft_script="$1"
+    local restore_script set
+
+    fail_closed_enabled || return 1
+    [ -f "$LISTS_CACHE_FOLDER/loaded" ] || return 1
+
+    restore_script="$(mktemp)"
+    for set in "$NFT_COMMON_SET_NAME" "$NFT_DISCORD_SET_NAME"; do
+        grep -q "^add set inet $NFT_TABLE_NAME $set " "$nft_script" || continue
+        [ -s "$LISTS_CACHE_FOLDER/$set" ] || continue
+        print_add_set_elements_commands "$set" < "$LISTS_CACHE_FOLDER/$set" >> "$restore_script"
+    done
+
+    if [ -s "$restore_script" ] && ! nft -f "$restore_script"; then
+        rm -f "$restore_script"
+        log "Failed to load the lists kept on flash, waiting for the lists update" "warn"
+        return 1
+    fi
+    rm -f "$restore_script"
+
+    mkdir -p "$PODKOP_STATE_FOLDER"
+    print_lists_signature | awk -v cached="$LISTS_CACHE_FOLDER/loaded" '
+        BEGIN { while ((getline line < cached) > 0) seen[line] = 1 }
+        $0 in seen
+    ' > "$LISTS_LOADED_FILE"
+    log "Lists kept on flash are loaded, they are replaced by the lists update"
 }
 
 # While lists of the config are not loaded, domains of remote plain-text lists resolve to real addresses. In fail-closed
@@ -656,9 +765,7 @@ print_subnet_sets_elements_commands() {
 
     for set in "$NFT_COMMON_SET_NAME" "$NFT_DISCORD_SET_NAME"; do
         grep -q "^add set inet $NFT_TABLE_NAME $set " "$nft_script" || continue
-        nft list set inet "$NFT_TABLE_NAME" "$set" 2> /dev/null |
-            sed -n '/elements = {/,/}/p' | sed 's/.*elements = {//; s/}.*//' | tr ',' '\n' |
-            print_add_set_elements_commands "$set"
+        print_set_elements "$set" | print_add_set_elements_commands "$set"
     done
 }
 
@@ -699,17 +806,20 @@ create_nft_rules() {
             exit 1
         fi
     fi
+    local lists_restored=0
+    if [ "$table_exists" -ne 1 ] && restore_lists_cache "$nft_script"; then
+        lists_restored=1
+    fi
     rm -f "$nft_script"
 
-    # Lists of a kept table are refreshed after lists update, see finish_lists_staging. Only this start and its
-    # lists update use the staging folder, a lists update from cron writes to the lists in use
+    # Lists of a kept table (or loaded from flash) are refreshed after lists update, see finish_lists_staging. Only
+    # this start and its lists update use the staging folder, a lists update from cron writes to the lists in use
     rm -rf "$LISTS_STAGING_FOLDER"
     lists_staging_active=0
-    if [ "$table_exists" -eq 1 ]; then
+    [ "$table_exists" -eq 1 ] || rm -rf "$KEPT_RULESETS_FOLDER"
+    if [ "$table_exists" -eq 1 ] || [ "$lists_restored" -eq 1 ]; then
         mkdir -p "$LISTS_STAGING_FOLDER/rulesets"
         lists_staging_active=1
-    else
-        rm -rf "$KEPT_RULESETS_FOLDER"
     fi
 }
 
@@ -886,6 +996,120 @@ add_cron_job() {
 remove_cron_job() {
     (crontab -l | grep -v "/usr/bin/podkop list_update") | crontab -
     log "The cron job removed"
+}
+
+add_watchdog_cron_job() {
+    crontab -l 2> /dev/null | grep -qxF "$WATCHDOG_CRON_JOB" && return 0
+
+    (
+        crontab -l 2> /dev/null | grep -v "/usr/bin/podkop watchdog"
+        echo "$WATCHDOG_CRON_JOB"
+    ) | crontab -
+    log "The watchdog cron job has been created"
+
+    # The cron service does not start while there are no cron jobs, e.g. on a fresh install
+    pidof crond > /dev/null || /etc/init.d/cron start
+}
+
+remove_watchdog_cron_job() {
+    crontab -l 2> /dev/null | grep -q "/usr/bin/podkop watchdog" || return 0
+
+    (crontab -l | grep -v "/usr/bin/podkop watchdog") | crontab -
+    log "The watchdog cron job removed"
+}
+
+# Seconds since the file was modified
+file_age() {
+    echo $(($(date +%s) - $(date -r "$1" +%s)))
+}
+
+# A start of podkop is in progress. The lists update started by it runs on in a subshell with the same command line,
+# so the process of the start itself is checked
+podkop_start_running() {
+    local pid
+    pid="$(cat "$PODKOP_START_PID_FILE" 2> /dev/null)"
+
+    [ -n "$pid" ] && grep -qs "podkop" "/proc/$pid/cmdline"
+}
+
+sing_box_dns_alive() {
+    dig +time=2 +tries=1 +short @"$SB_DNS_INBOUND_ADDRESS" "$FAKEIP_TEST_DOMAIN" A 2> /dev/null |
+        grep -qE '^198\.1[89]\.'
+}
+
+# Self-healing, run by cron every minute and when WAN goes up (hotplug, reason wan-up). Brings back what a start that
+# did not complete, a crash or the internet going down left broken, so podkop recovers without a reboot however
+# many times the internet goes down and up. Does nothing while podkop is stopped
+watchdog() {
+    local reason="${1:-cron}"
+    local failures
+
+    # shellcheck disable=SC3023 # the lock is closed for the jobs started from here, see start_background_list_update
+    exec 8> "$WATCHDOG_LOCK_FILE"
+    if [ "$reason" = "wan-up" ]; then
+        flock 8
+    else
+        flock -n 8 || return 0
+    fi
+
+    # Stopped, or a stop or a start is in progress
+    [ -f "$PODKOP_RUN_ID_FILE" ] || return 0
+    podkop_start_running && return 0
+
+    if [ ! -f "$PODKOP_STARTED_FILE" ]; then
+        # The start stopped on an error, in fail-closed mode the protection stays. Errors of the config do not go away
+        # by themselves, so it is retried every 5 minutes, or right away when the internet is back
+        if [ "$reason" = "wan-up" ] || [ "$(file_age "$PODKOP_RUN_ID_FILE")" -ge 300 ]; then
+            log "Watchdog: podkop start did not complete, restarting podkop" "warn"
+            /etc/init.d/podkop restart 8>&-
+        fi
+        return 0
+    fi
+
+    if ! nft list table inet "$NFT_TABLE_NAME" > /dev/null 2>&1; then
+        log "Watchdog: nft table of podkop is missing, restarting podkop" "warn"
+        /etc/init.d/podkop restart 8>&-
+        return 0
+    fi
+
+    # Lost when netifd is restarted
+    if ! ip rule list | grep -q "lookup $RT_TABLE_NAME" ||
+        ! ip route list table "$RT_TABLE_NAME" 2> /dev/null | grep -q "local default dev lo"; then
+        log "Watchdog: policy routing of podkop is missing, restoring it" "warn"
+        route_table_rule_mark
+    fi
+
+    # procd gives up on sing-box after a few failed starts in a row, e.g. while the internet is down and its remote
+    # rule sets are not cached. A sing-box that runs but does not answer DNS is restarted after 3 checks in a row
+    if ! pidof sing-box > /dev/null; then
+        log "Watchdog: sing-box is not running, restarting it" "warn"
+        /etc/init.d/sing-box restart 8>&-
+        rm -f "$WATCHDOG_DNS_FAILURES_FILE"
+    elif sing_box_dns_alive; then
+        rm -f "$WATCHDOG_DNS_FAILURES_FILE"
+    else
+        failures=$(($(cat "$WATCHDOG_DNS_FAILURES_FILE" 2> /dev/null || echo 0) + 1))
+        if [ "$failures" -ge 3 ]; then
+            log "Watchdog: sing-box does not answer DNS, restarting it" "warn"
+            /etc/init.d/sing-box restart 8>&-
+            rm -f "$WATCHDOG_DNS_FAILURES_FILE"
+        else
+            echo "$failures" > "$WATCHDOG_DNS_FAILURES_FILE"
+        fi
+    fi
+
+    # In fail-closed mode direct traffic is blocked until the lists are loaded. The update after the start retries
+    # with a growing pause, when the internet is back it is restarted to load them now
+    if fail_closed_enabled && ! lists_loaded; then
+        if ! list_update_running; then
+            log "Watchdog: lists are not loaded and no lists update is running, starting it" "warn"
+            start_background_list_update > /dev/null 2>&1
+        elif [ "$reason" = "wan-up" ]; then
+            log "Watchdog: WAN is up, restarting the lists update"
+            stop_list_update
+            start_background_list_update > /dev/null 2>&1
+        fi
+    fi
 }
 
 list_update() {
@@ -1432,6 +1656,14 @@ sing_box_configure_route() {
     config_foreach include_source_ips_in_routing_handler "section"
 
     config_foreach configure_routing_for_section_lists "section"
+
+    if fail_closed_enabled; then
+        # Traffic sent to sing-box that no rule matched would go to the final outbound, i.e. direct. The FakeIP
+        # check of the diagnostics is the only such traffic that is expected
+        config=$(sing_box_cf_proxy_domain "$config" "$SB_TPROXY_INBOUND_TAG" "$FAKEIP_TEST_DOMAIN" \
+            "$SB_DIRECT_OUTBOUND_TAG")
+        config=$(sing_box_cm_add_reject_route_rule "$config" "$(gen_id)" "$SB_TPROXY_INBOUND_TAG")
+    fi
 }
 
 include_source_ips_in_routing_handler() {
@@ -3272,6 +3504,7 @@ Available commands:
     restart                 Restart podkop service
     main                    Run main podkop process
     list_update             Update domain lists
+    watchdog [wan-up]       Restore what is broken (run by cron and on WAN up)
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
@@ -3312,6 +3545,9 @@ main)
     ;;
 list_update)
     list_update_command
+    ;;
+watchdog)
+    watchdog "${2:-cron}"
     ;;
 check_proxy)
     check_proxy
