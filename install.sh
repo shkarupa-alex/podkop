@@ -61,7 +61,7 @@ pkg_fetch() {
 }
 
 podkop_fail_closed() {
-    [ -x /etc/init.d/podkop ] && [ "$(uci -q get podkop.settings.fail_closed)" = "1" ]
+    [ -x /etc/init.d/podkop ] && [ "$(uci -q get podkop.settings.fail_closed)" != "0" ]
 }
 
 # Podkop is running or keeps its fail-closed protection (its nft table exists)
@@ -277,7 +277,7 @@ check_system() {
 
     if ! nslookup google.com >/dev/null 2>&1; then
         msg "DNS is not working."
-        if [ "$(uci -q get podkop.settings.fail_closed)" = "1" ]; then
+        if [ "$(uci -q get podkop.settings.fail_closed)" != "0" ]; then
             msg "Podkop fail-closed mode keeps DNS blocked while podkop is not running. Restore direct DNS with:"
             msg "/etc/init.d/podkop stop"
         fi

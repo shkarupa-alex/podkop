@@ -20,7 +20,15 @@ KEPT_RULESETS_FOLDER="$PODKOP_STATE_FOLDER/kept-rulesets"
 LISTS_LOADED_FILE="$PODKOP_STATE_FOLDER/lists-loaded"
 PODKOP_STARTED_FILE="$PODKOP_STATE_FOLDER/started"
 PODKOP_RUN_ID_FILE="$PODKOP_STATE_FOLDER/run-id"
+PODKOP_START_PID_FILE="$PODKOP_STATE_FOLDER/start-pid"
+# The clock was set by sync_time since the boot (the folder is on tmpfs)
+TIME_SYNCED_FILE="$PODKOP_STATE_FOLDER/time-synced"
 LISTS_UPDATE_LOCK_FILE="/var/lock/podkop-list-update.lock"
+# Lists loaded in fail-closed mode, kept on flash for the next boot. Written only when they change
+LISTS_CACHE_FOLDER="/usr/share/podkop/lists-cache"
+WATCHDOG_LOCK_FILE="/var/lock/podkop-watchdog.lock"
+WATCHDOG_DNS_FAILURES_FILE="$PODKOP_STATE_FOLDER/watchdog-dns-failures"
+WATCHDOG_CRON_JOB="* * * * * /usr/bin/podkop watchdog"
 
 ## nft
 NFT_TABLE_NAME="PodkopTable"
@@ -29,6 +37,7 @@ NFT_COMMON_SET_NAME="podkop_subnets"
 NFT_DISCORD_SET_NAME="podkop_discord_subnets"
 NFT_INTERFACE_SET_NAME="interfaces"
 NFT_GATE_CHAIN_NAME="gate"
+NFT_GUARD_CHAIN_NAME="guard"
 NFT_FAKEIP_MARK="0x00100000"
 NFT_OUTBOUND_MARK="0x00200000"
 

@@ -1,0 +1,13 @@
+#!/bin/sh
+# The internet is back: what gave up while it was down (sing-box, the lists update, a start) is restarted now,
+# not at the next run of the watchdog from cron
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ -f /tmp/podkop-state/run-id ] || exit 0
+
+. /lib/functions/network.sh
+# shellcheck disable=SC2154 # set by network_find_wan
+network_find_wan wan_interface
+[ "$INTERFACE" = "$wan_interface" ] || exit 0
+
+/usr/bin/podkop watchdog wan-up > /dev/null 2>&1 &

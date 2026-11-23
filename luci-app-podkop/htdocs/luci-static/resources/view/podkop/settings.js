@@ -348,7 +348,7 @@ function createSettingsContent(section, singBoxFeatures = []) {
       "During restarts, updates, applying settings and after a failed start, traffic that should be proxied is blocked instead of going direct. Until Podkop is running again, DNS via dnsmasq does not work for LAN clients and the router itself, including for direct resources (unless DHCP is left untouched), and IPv6 from LAN is blocked. After a router reboot and after adding lists, all direct traffic from LAN is blocked until the lists are downloaded, and stays blocked while a list can not be downloaded. Stopping Podkop turns the protection off until the next start",
     ),
   );
-  o.default = "0";
+  o.default = "1";
   o.rmempty = false;
 
   o = section.option(
